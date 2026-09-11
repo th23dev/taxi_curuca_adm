@@ -31,20 +31,21 @@ service cloud.firestore {
       return d.name is string && d.name.size() >= 2 && d.name.size() <= 120 &&
         d.vehicleModel is string && d.vehicleModel.size() >= 2 && d.vehicleModel.size() <= 100 &&
         d.vehicleColor is string && d.vehicleColor.size() <= 40 &&
-        d.origin is string && d.origin.size() >= 2 && d.origin.size() <= 150 &&
-        d.destination is string && d.destination.size() >= 2 && d.destination.size() <= 150 &&
         d.vehicleType in ['car', 'motorcycle'] && d.serviceType in ['private', 'shared'] &&
-        d.priceCents is int && d.priceCents >= 0 && d.priceCents <= 1000000 &&
-        d.seatsTotal is int && d.seatsTotal >= 1 && d.seatsTotal <= 20 &&
-        d.seatsAvailable is int && d.seatsAvailable >= 0 && d.seatsAvailable <= d.seatsTotal &&
-        d.online is bool && (d.vehicleType != 'motorcycle' || (d.seatsTotal == 1 && d.serviceType == 'private'));
+        d.online is bool && (d.vehicleType != 'motorcycle' || d.serviceType == 'private') &&
+        (d.serviceType == 'private' || (
+          d.origin is string && d.origin.size() >= 2 && d.origin.size() <= 150 &&
+          d.destination is string && d.destination.size() >= 2 && d.destination.size() <= 150 &&
+          d.priceCents is int && d.priceCents >= 0 && d.priceCents <= 1000000 &&
+          d.seatsTotal is int && d.seatsTotal >= 1 && d.seatsTotal <= 20 &&
+          d.seatsAvailable is int && d.seatsAvailable >= 0 && d.seatsAvailable <= d.seatsTotal));
     }
     function validAdminTransition() {
       let from = resource.data.status;
       let to = request.resource.data.status;
-      return (from == 'confirmed' && to in ['accepted', 'cancelled']) ||
+      return (from in ['requested', 'confirmed'] && to in ['accepted', 'cancelled']) ||
         (from == 'accepted' && to in ['in_progress', 'cancelled']) ||
-        (from == 'in_progress' && to in ['completed', 'cancelled']);
+        (from == 'in_progress' && to == 'completed');
     }
     function isOwner(uid) { return signedIn() && request.auth.uid == uid; }
     function userData(uid) {
@@ -59,11 +60,12 @@ service cloud.firestore {
         d.vehicleModel is string && d.vehicleModel.size() >= 2 &&
         d.vehicleColor is string && d.vehicleColor.size() > 0 &&
         d.vehicleType in ['car', 'motorcycle'] && d.serviceType in ['private', 'shared'] &&
-        d.seatsTotal is int && d.seatsTotal >= 1 && d.seatsTotal <= 20 &&
-        d.seatsAvailable is int && d.seatsAvailable > 0 && d.seatsAvailable <= d.seatsTotal &&
-        (d.vehicleType != 'motorcycle' || (d.seatsTotal == 1 && d.serviceType == 'private')) &&
+        (d.vehicleType != 'motorcycle' || d.serviceType == 'private') &&
         (d.serviceType != 'shared' ||
-          (d.origin is string && d.origin.size() > 0 && d.destination is string && d.destination.size() > 0 &&
+          (d.routeId is string && d.routeId.size() > 0 &&
+           d.seatsTotal is int && d.seatsTotal >= 1 && d.seatsTotal <= 20 &&
+           d.seatsAvailable is int && d.seatsAvailable > 0 && d.seatsAvailable <= d.seatsTotal &&
+           d.origin is string && d.origin.size() > 0 && d.destination is string && d.destination.size() > 0 &&
            d.priceCents is int && d.priceCents > 0 && d.priceCents <= 1000000 &&
            ((d.get('departureLabel', '') is string && d.get('departureLabel', '').size() > 0) ||
             (d.get('departure', '') is string && d.get('departure', '').size() > 0) ||
@@ -75,8 +77,100 @@ service cloud.firestore {
         request.resource.data.updatedAt == request.time && request.resource.data.online is bool &&
         (request.resource.data.online == false || (approvedDriver() && validOnlineDriver()));
     }
+    function ownSharedOffer(driverId) {
+      let d = request.resource.data;
+      return isOwner(driverId) && approvedDriver() && resource.data.serviceType == 'shared' &&
+        resource.data.online == false &&
+        resource.data.get('seatsAvailable', 0) == resource.data.get('seatsTotal', 0) &&
+        d.diff(resource.data).affectedKeys().hasOnly(['routeId', 'origin', 'destination', 'departureLabel', 'priceCents', 'seatsTotal', 'seatsAvailable', 'departureStarted', 'updatedAt']) &&
+        d.get('departureStarted', false) == false &&
+        d.updatedAt == request.time && d.seatsAvailable == d.seatsTotal && validOnlineDriver();
+    }
+    function validPrivateRequest() {
+      let d = request.resource.data;
+      let driver = get(/databases/$(database)/documents/drivers/$(d.driverId)).data;
+      return d.status == 'requested' && d.serviceType == 'private' && d.createdAt == request.time &&
+        d.keys().hasOnly(['passengerId', 'driverId', 'serviceType', 'status', 'createdAt', 'passengerName', 'driverName', 'vehicleType', 'vehicleModel', 'vehicleColor']) &&
+        driver.online == true && driver.get('activeTripId', '') == '' && driver.serviceType == 'private' && userData(d.driverId).driverApproved == true;
+    }
+    function validSharedReservation(tripId) {
+      let d = request.resource.data;
+      let driver = get(/databases/$(database)/documents/drivers/$(d.driverId)).data;
+      let afterDriver = getAfter(/databases/$(database)/documents/drivers/$(d.driverId)).data;
+      return d.status == 'confirmed' && d.serviceType == 'shared' && driver.serviceType == 'shared' &&
+        driver.online == true && driver.get('departureStarted', false) == false && d.routeId == driver.routeId &&
+        d.origin == driver.origin && d.destination == driver.destination && d.priceCents == driver.priceCents &&
+        d.seats is int && d.seats > 0 && d.seats <= driver.seatsAvailable &&
+        afterDriver.lastReservationId == tripId && afterDriver.seatsAvailable == driver.seatsAvailable - d.seats;
+    }
     function tripData(tripId) {
       return get(/databases/$(database)/documents/trips/$(tripId)).data;
+    }
+    // Both sides of each transaction validate the same state change.
+    function privateLockWrite(driverId) {
+      let beforeId = resource.data.get('activeTripId', '');
+      let afterId = request.resource.data.get('activeTripId', '');
+      let id = afterId != '' ? afterId : beforeId;
+      let before = tripData(id);
+      let after = getAfter(/databases/$(database)/documents/trips/$(id)).data;
+      return signedIn() && resource.data.serviceType == 'private' &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['activeTripId', 'updatedAt']) &&
+        request.resource.data.updatedAt == request.time && before.driverId == driverId &&
+        (isAdmin() || request.auth.uid == before.driverId || request.auth.uid == before.passengerId) &&
+        ((beforeId == '' && afterId != '' && resource.data.online == true &&
+          before.status in ['requested', 'confirmed'] && after.status == 'accepted') ||
+         (beforeId != '' && afterId == '' && before.status in ['accepted', 'in_progress'] && after.status in ['completed', 'cancelled']));
+    }
+    function sharedRefundWrite(driverId) {
+      let id = request.resource.data.lastCancellationId;
+      let before = tripData(id);
+      let after = getAfter(/databases/$(database)/documents/trips/$(id)).data;
+      return signedIn() && resource.data.serviceType == 'shared' &&
+        resource.data.get('departureStarted', false) == false &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['seatsAvailable', 'lastCancellationId']) &&
+        before.driverId == driverId && before.routeId == resource.data.routeId && before.serviceType == 'shared' &&
+        (isAdmin() || request.auth.uid == before.passengerId || request.auth.uid == before.driverId) &&
+        before.status in ['confirmed', 'accepted'] && before.get('seatsRefunded', false) == false &&
+        after.status == 'cancelled' && after.seatsRefunded == true &&
+        before.seats is int && before.seats > 0 &&
+        request.resource.data.seatsAvailable == resource.data.seatsAvailable + before.seats &&
+        request.resource.data.seatsAvailable <= resource.data.seatsTotal;
+    }
+    function sharedDepartureWrite(driverId) {
+      let id = request.resource.data.departureTripId;
+      let before = tripData(id);
+      let after = getAfter(/databases/$(database)/documents/trips/$(id)).data;
+      return (isAdmin() || (isOwner(driverId) && approvedDriver())) && resource.data.serviceType == 'shared' &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['departureStarted', 'departureTripId', 'updatedAt']) &&
+        request.resource.data.departureStarted == true && request.resource.data.updatedAt == request.time &&
+        before.driverId == driverId && before.routeId == resource.data.routeId &&
+        before.status == 'accepted' && after.status == 'in_progress';
+    }
+    function tripEffects(id) {
+      let d = resource.data;
+      let driver = get(/databases/$(database)/documents/drivers/$(d.driverId)).data;
+      let after = getAfter(/databases/$(database)/documents/drivers/$(d.driverId)).data;
+      let to = request.resource.data.status;
+      return d.get('serviceType', 'private') == 'shared'
+        ? (d.routeId == driver.routeId &&
+          (to == 'cancelled'
+            ? (driver.get('departureStarted', false) == false && d.get('seatsRefunded', false) == false &&
+               request.resource.data.seatsRefunded == true && after.lastCancellationId == id &&
+               after.seatsAvailable == driver.seatsAvailable + d.seats)
+            : (to != 'in_progress' || (after.departureStarted == true && after.departureTripId == id))))
+        : (to == 'accepted'
+            ? (driver.online == true && driver.get('activeTripId', '') == '' && after.activeTripId == id)
+            : (d.status in ['accepted', 'in_progress']
+                ? (driver.activeTripId == id && (to in ['completed', 'cancelled'] ? after.activeTripId == '' : after.activeTripId == id))
+                : true));
+    }
+    function tripUpdateFields() {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt', 'cancelledBy', 'cancellationReason', 'seatsRefunded']) &&
+        request.resource.data.updatedAt == request.time &&
+        (request.resource.data.status == 'cancelled'
+          ? (request.resource.data.cancelledBy == request.auth.uid &&
+             request.resource.data.get('cancellationReason', '') is string && request.resource.data.get('cancellationReason', '').size() <= 500)
+          : request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt']));
     }
     function belongsToTrip(tripId) {
       return signedIn() &&
@@ -105,7 +199,8 @@ service cloud.firestore {
     function validPassengerReservation(driverId) {
       let tripId = request.resource.data.lastReservationId;
       let newTrip = getAfter(/databases/$(database)/documents/trips/$(tripId)).data;
-      return signedIn() && resource.data.online == true &&
+      return signedIn() && resource.data.online == true && resource.data.serviceType == 'shared' &&
+        !exists(/databases/$(database)/documents/trips/$(tripId)) &&
         request.resource.data.diff(resource.data).affectedKeys()
           .hasOnly(['seatsAvailable', 'lastReservationId']) &&
         request.resource.data.seatsAvailable >= 0 &&
@@ -158,7 +253,8 @@ service cloud.firestore {
         request.resource.data.uid == driverId && request.resource.data.online == false &&
         request.resource.data.vehicleModel is string && request.resource.data.vehicleModel.size() >= 2 && request.resource.data.vehicleModel.size() <= 100 &&
         request.resource.data.vehicleType in ['car', 'motorcycle'] &&
-        request.resource.data.seatsTotal == 1 && request.resource.data.seatsAvailable == 1 && request.resource.data.priceCents == 0;
+        (request.resource.data.get('serviceType', 'private') == 'private' ||
+         (request.resource.data.seatsTotal == 1 && request.resource.data.seatsAvailable == 1 && request.resource.data.priceCents == 0));
       allow update: if isAdmin() && managedProfile(driverId) && adminTimestamp() &&
         request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'online', 'updatedAt']) &&
         request.resource.data.name == getAfter(/databases/$(database)/documents/users/$(driverId)).data.fullName &&
@@ -166,8 +262,9 @@ service cloud.firestore {
       allow create: if isAdmin() && request.resource.data.uid == driverId &&
         getAfter(/databases/$(database)/documents/users/$(driverId)).data.driverApproved == true &&
         getAfter(/databases/$(database)/documents/driverApplications/$(driverId)).data.status == 'approved' &&
-        request.resource.data.online == false && request.resource.data.seatsTotal == 1 &&
-        request.resource.data.seatsAvailable == 1 && request.resource.data.priceCents == 0;
+        request.resource.data.online == false &&
+        (request.resource.data.get('serviceType', 'private') == 'private' ||
+         (request.resource.data.seatsTotal == 1 && request.resource.data.seatsAvailable == 1 && request.resource.data.priceCents == 0));
       allow update: if isAdmin() && validAdminDriver() && adminTimestamp() &&
         request.resource.data.diff(resource.data).affectedKeys().hasOnly([
           'name', 'vehicleModel', 'vehicleColor', 'vehicleType', 'serviceType', 'origin', 'destination',
@@ -175,7 +272,8 @@ service cloud.firestore {
         ]) && (!request.resource.data.online || userData(driverId).driverApproved == true);
       allow read: if signedIn();
       // Driver records are created/edited by the administration, never by passengers.
-      allow update: if ownDriverAvailability(driverId) ||
+      allow update: if privateLockWrite(driverId) || sharedRefundWrite(driverId) || sharedDepartureWrite(driverId);
+      allow update: if ownDriverAvailability(driverId) || ownSharedOffer(driverId) ||
         validPassengerReservation(driverId);
       allow delete: if false;
     }
@@ -188,17 +286,15 @@ service cloud.firestore {
 
     match /trips/{tripId} {
       allow read: if isAdmin();
-      allow update: if isAdmin() && validAdminTransition() && adminTimestamp() &&
-        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt']);
+      allow update: if isAdmin() && validAdminTransition() && tripUpdateFields() && tripEffects(tripId);
       allow create: if signedIn() && request.resource.data.passengerId == request.auth.uid &&
-        request.resource.data.status == 'confirmed';
+        (validPrivateRequest() || validSharedReservation(tripId));
       allow read: if signedIn() &&
         (resource.data.passengerId == request.auth.uid || (resource.data.driverId == request.auth.uid && approvedDriver()));
       allow update: if signedIn() &&
-        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt']) &&
-        request.resource.data.updatedAt == request.time &&
+        tripUpdateFields() && tripEffects(tripId) &&
         ((resource.data.driverId == request.auth.uid && approvedDriver() && validAdminTransition()) ||
-         (resource.data.passengerId == request.auth.uid && resource.data.status in ['confirmed', 'accepted'] &&
+         (resource.data.passengerId == request.auth.uid && resource.data.status in ['requested', 'confirmed', 'accepted'] &&
           request.resource.data.status == 'cancelled'));
       allow delete: if false;
     }
